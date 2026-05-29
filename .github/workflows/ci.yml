@@ -1,0 +1,188 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      model: ${{ steps.filter.outputs.model }}
+      training: ${{ steps.filter.outputs.training }}
+      data: ${{ steps.filter.outputs.data }}
+      parallel: ${{ steps.filter.outputs.parallel }}
+      inference: ${{ steps.filter.outputs.inference }}
+      ablations: ${{ steps.filter.outputs.ablations }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            model:
+              - "src/**"
+              - "tests/test_*.py"
+              - "config/model/**"
+              - "pyproject.toml"
+              - "requirements.txt"
+              - ".github/workflows/**"
+            training:
+              - "training/**"
+              - "tests/training/**"
+              - "data/data_utils.py"
+              - "pyproject.toml"
+              - "requirements.txt"
+              - ".github/workflows/**"
+            data:
+              - "data/**"
+              - "tests/data/**"
+              - "config/data/**"
+              - "pyproject.toml"
+              - "requirements.txt"
+              - ".github/workflows/**"
+            parallel:
+              - "parallel/**"
+              - "tests/parallel/**"
+              - "scripts/parallel_cli.py"
+              - "src/**"
+              - "training/**"
+              - "pyproject.toml"
+              - "requirements.txt"
+              - ".github/workflows/**"
+            inference:
+              - "inference/**"
+              - "tests/inference/**"
+              - "scripts/inference_cli.py"
+              - "src/**"
+              - "data/**"
+              - "pyproject.toml"
+              - "requirements.txt"
+              - ".github/workflows/**"
+            ablations:
+              - "ablations/**"
+              - "tests/experiments/**"
+              - "scripts/ablation_cli.py"
+              - "src/**"
+              - "training/**"
+              - "data/**"
+              - "pyproject.toml"
+              - "requirements.txt"
+              - ".github/workflows/**"
+
+  quick:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install light dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Import smoke
+        run: |
+          python - <<'PY'
+          from src.mini_deepseek_class import DeepSeekV4LM, DeepSeekV4LMConfig
+          cfg = DeepSeekV4LMConfig(vocab_size=32, d_model=16, n_layers=1, max_seq_len=8, attention_type="mha", ffn_type="dense", n_heads=2, head_dim=8, rotary_dim=8)
+          model = DeepSeekV4LM(cfg)
+          print(type(model).__name__)
+          PY
+
+  model-tests:
+    needs: changes
+    if: needs.changes.outputs.model == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,data]"
+      - name: Run CPU model/component tests
+        run: pytest tests/*.py
+
+  training-tests:
+    needs: changes
+    if: needs.changes.outputs.training == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,data]"
+      - name: Run CPU training tests
+        run: pytest tests/training
+
+  data-tests:
+    needs: changes
+    if: needs.changes.outputs.data == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,data]"
+      - name: Run dataset loader tests
+        run: pytest tests/data
+
+  parallel-tests:
+    needs: changes
+    if: needs.changes.outputs.parallel == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,data]"
+      - name: Run CPU parallelism tests
+        run: pytest tests/parallel
+
+  inference-tests:
+    needs: changes
+    if: needs.changes.outputs.inference == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,data]"
+      - name: Run CPU inference tests
+        run: pytest tests/inference
+
+  ablation-tests:
+    needs: changes
+    if: needs.changes.outputs.ablations == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,data]"
+      - name: Run CPU ablation tests
+        run: pytest tests/experiments
