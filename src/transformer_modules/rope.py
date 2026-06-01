@@ -1,41 +1,29 @@
+"""
+RoPE (Rotary Positional Embedding) 旋转位置编码
+核心思想: 将位置信息编码为旋转角度，让 attention score 自然依赖于相对位置。
+公式: RoPE(x, pos) = x * cos(pos * theta) + rotate_half(x) * sin(pos * theta)
+其中 theta_i = 1 / base^(2i / dim)，不同维度对应不同频率。
+"""
+
 import torch
 import torch.nn as nn
 from typing import Optional
 
 from src.transformer_modules.rope_utils import *
-# ============================================================
-# RotaryEmbedding
-# ============================================================
+
 
 class RotaryEmbedding(nn.Module):
     """
-    Rotary Positional Embedding utility.
-
-    Expected input:
-        x: [B, T, H, D]
-
-    where:
-        B = batch size
-        T = sequence length
-        H = number of heads
-        D = head_dim
-
-    Supports:
-        - full RoPE: rotary_dim == dim
-        - partial RoPE: rotary_dim < dim
-        - automatic positions with start_pos
-        - explicit position_ids with shape [T]
-        - explicit position_ids with shape [B, T]
-        - negative positions
-        - positions larger than max_seq_len
-
-    This module does NOT implement:
-        - attention
-        - q/k/v projections
-        - KV cache
-        - RoPE scaling
-        - learned positional embeddings
-        - cos/sin caching
+    旋转位置编码模块。
+    
+    输入: x [B, T, H, D]  (batch, 序列长度, 头数, 头维度)
+    输出: 同形状张量，已注入位置信息
+    
+    支持:
+    - 全量 RoPE (rotary_dim == dim)
+    - 部分 RoPE (rotary_dim < dim): 只对部分维度旋转，其余维度保留
+    - 自动位置 (position_ids=None, 使用 start_pos 偏移)
+    - 显式位置 (position_ids: [T] 或 [B, T])
     """
 
     def __init__(
@@ -72,19 +60,15 @@ class RotaryEmbedding(nn.Module):
         self.rotary_dim = rotary_dim
         self.base = base
 
-        # Conceptually:
-        # inv_freq[i] = 1 / base^(i / rotary_dim), for even rotary indices.
-        #
-        # torch.arange(0, rotary_dim, 2) gives:
-        # 0, 2, 4, ...
-        # so exponent becomes:
-        # 0/rotary_dim, 2/rotary_dim, 4/rotary_dim, ...
+        # 逆频率向量: inv_freq[i] = 1 / base^(2i / rotary_dim)
+        # 低索引 -> 高频(捕捉局部位置), 高索引 -> 低频(捕捉远距离位置)
         inv_freq = 1.0 / (
             base ** (
                 torch.arange(0, rotary_dim, 2, dtype=torch.float32)
                 / rotary_dim
             ))
 
+        # 注册为 buffer: 不参与梯度更新，但会随模型 .to(device) 移动
         self.register_buffer(
             "inv_freq",
             inv_freq,
@@ -98,18 +82,10 @@ class RotaryEmbedding(nn.Module):
         device: torch.device,
         position_ids: Optional[torch.Tensor],
         start_pos: int,) -> torch.Tensor:
-        """
-        Build or validate position_ids.
-
-        Supported:
-            None      -> [T]
-            [T]       -> [T]
-            [B, T]    -> [B, T]
-
-        Negative positions are allowed.
-        """
+        """构建或验证位置 id"""
 
         if position_ids is None:
+            # 默认: 从 start_pos 开始的连续位置
             return torch.arange(
                 start_pos,
                 start_pos + seq_len,
@@ -145,35 +121,30 @@ class RotaryEmbedding(nn.Module):
         target_dtype: torch.dtype,
         device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Build cos/sin tensors dynamically.
-
-        If position_ids:
-            [T]    -> cos/sin: [1, T, 1, rotary_dim]
-            [B,T]  -> cos/sin: [B, T, 1, rotary_dim]
+        根据位置计算 cos/sin 张量。
+        position_ids [T] -> cos/sin [1, T, 1, rotary_dim]
+        position_ids [B,T] -> cos/sin [B, T, 1, rotary_dim]
         """
 
         position_ids = position_ids.to(device=device, dtype=torch.float32)
         inv_freq = self.inv_freq.to(device=device, dtype=torch.float32)
 
-        # freqs:
-        # [T, rotary_dim // 2] or [B, T, rotary_dim // 2]
+        # 外积: position * inv_freq -> 每个位置在每个频率上的角度
+        # freqs: [T, rotary_dim//2] 或 [B, T, rotary_dim//2]
         freqs = position_ids[..., None] * inv_freq
 
-        # Expand from half dimension to full rotary_dim.
-        # Shape:
-        # [T, rotary_dim] or [B, T, rotary_dim]
+        # 拼接成完整维度: [cos(f1), cos(f2), ..., cos(f1), cos(f2), ...]
         emb = torch.cat((freqs, freqs), dim=-1)
 
         cos = torch.cos(emb)
         sin = torch.sin(emb)
 
+        # 增加维度以便广播到 [B, T, H, rotary_dim]
         if position_ids.dim() == 1:
-            # [T, R] -> [1, T, 1, R]
-            cos = cos[None, :, None, :]
+            cos = cos[None, :, None, :]  # [1, T, 1, R]
             sin = sin[None, :, None, :]
         else:
-            # [B, T, R] -> [B, T, 1, R]
-            cos = cos[:, :, None, :]
+            cos = cos[:, :, None, :]     # [B, T, 1, R]
             sin = sin[:, :, None, :]
 
         cos = cos.to(dtype=target_dtype)
@@ -187,22 +158,12 @@ class RotaryEmbedding(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         start_pos: int = 0) -> torch.Tensor:
         """
-        Args:
-            x:
-                Attention tensor with shape [B, T, H, D].
-
-            position_ids:
-                Optional positions:
-                    None
-                    [T]
-                    [B, T]
-
-            start_pos:
-                Offset used only when position_ids is None.
-
-        Returns:
-            y:
-                Tensor with same shape, dtype, and device as x.
+        对输入施加旋转位置编码。
+        
+        输入: x [B, T, H, D]
+        输出: 同形状，已编码位置信息
+        
+        RoPE 公式: y = x * cos(theta) + rotate_half(x) * sin(theta)
         """
 
         if x.dim() != 4:
@@ -231,15 +192,17 @@ class RotaryEmbedding(nn.Module):
             target_dtype=original_dtype,
             device=device)
 
+        # 部分 RoPE: 只旋转后 rotary_dim 维，前面的维度直接保留
         pass_dim = self.dim - self.rotary_dim
 
         if pass_dim > 0:
-            x_pass = x[..., :pass_dim]
-            x_rot = x[..., pass_dim:]
+            x_pass = x[..., :pass_dim]       # 不旋转的部分
+            x_rot = x[..., pass_dim:]        # 要旋转的部分
         else:
             x_pass = None
             x_rot = x
 
+        # 核心旋转: x * cos + rotate_half(x) * sin
         x_rotated = (x_rot * cos) + (rotate_half(x_rot) * sin)
 
         if x_pass is not None:

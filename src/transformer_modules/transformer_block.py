@@ -1,7 +1,10 @@
-# ============================================================
-# Mini DeepSeek-V4 TransformerBlock Baseline
-# Pre-Norm Dense Transformer Block
-# ============================================================
+"""
+Transformer Block (Pre-Norm 结构)
+标准的 Transformer 层，采用 Pre-Norm 残差连接:
+    x = x + Attention(Norm(x))
+    x = x + MLP(Norm(x))
+这是 DeepSeek / LLaMA 等现代 LLM 普遍采用的结构。
+"""
 
 from dataclasses import dataclass
 from typing import Optional, Dict, Tuple, Union
@@ -14,16 +17,14 @@ from src.transformer_modules.SwiGLU import *
 from src.transformer_modules.RMSNorm import *
 from src.transformer_modules.mha_baseline import *
 from src.transformer_modules.embedding_module import *
-# ============================================================
-# CONFIG
-# ============================================================
+
 
 @dataclass
 class TransformerBlockConfig:
-    d_model: int
-    rms_norm_eps: float = 1e-6
+    d_model: int                            # 模型维度
+    rms_norm_eps: float = 1e-6              # RMSNorm 的 epsilon
 
-    # Attention config
+    # --- 注意力相关配置 ---
     n_heads: int = 4
     head_dim: Optional[int] = None
     attention_dropout: float = 0.0
@@ -34,14 +35,14 @@ class TransformerBlockConfig:
     rotary_dim: Optional[int] = None
     max_seq_len: int = 1024
 
-    # MLP config
+    # --- MLP 相关配置 ---
     mlp_hidden_dim: Optional[int] = None
     mlp_expansion_factor: float = 4.0
     mlp_multiple_of: int = 1
     mlp_dropout: float = 0.0
     use_mlp_bias: bool = False
 
-    # Initialization
+    # --- 初始化 ---
     init_std: float = 0.02
 
     def validate(self) -> None:
@@ -59,11 +60,9 @@ class TransformerBlockConfig:
         if self.init_std <= 0:
             raise ValueError(f"init_std must be > 0, got {self.init_std}")
 
-        # Validate attention by constructing its config and calling validate.
         attention_config = self.to_attention_config()
         attention_config.validate()
 
-        # Validate MLP by constructing its config and calling validate.
         mlp_config = self.to_mlp_config()
         mlp_config.validate()
 
@@ -80,6 +79,7 @@ class TransformerBlockConfig:
             )
 
     def to_attention_config(self) -> "CausalMHAConfig":
+        """转换为注意力模块的配置"""
         return CausalMHAConfig(
             d_model=self.d_model,
             n_heads=self.n_heads,
@@ -94,6 +94,7 @@ class TransformerBlockConfig:
             init_std=self.init_std)
 
     def to_mlp_config(self) -> "SwiGLUMLPConfig":
+        """转换为 MLP 模块的配置"""
         return SwiGLUMLPConfig(
             d_model=self.d_model,
             hidden_dim=self.mlp_hidden_dim,
@@ -104,37 +105,18 @@ class TransformerBlockConfig:
             init_std=self.init_std,)
 
 
-# ============================================================
-# TRANSFORMER BLOCK
-# ============================================================
-
 class TransformerBlock(nn.Module):
     """
-    Dense pre-norm causal Transformer block.
-
-    Input:
-        x: [B, T, d_model]
-
-    Forward:
-        x = x + attention(norm1(x))
-        x = x + mlp(norm2(x))
-
-    Output:
-        x: [B, T, d_model]
-
-    If need_weights=True:
-        returns:
-            x, {"attn_weights": attn_weights}
-
-    This module intentionally does NOT include:
-        - MoE
-        - mHC
-        - HCA
-        - CSA
-        - KV cache
-        - gradient checkpointing
-        - attention sink
-        - query/key RMSNorm
+    Pre-Norm Transformer Block。
+    
+    结构 (Pre-Norm + 残差连接):
+        x = x + Attention(RMSNorm(x))   # 注意力子层
+        x = x + SwiGLU(RMSNorm(x))      # 前馈子层
+    
+    输入: x [B, T, d_model]
+    输出: x [B, T, d_model]
+    
+    注意: 本模块是"干净"的基线实现，不包含 MoE/mHC/HCA/CSA 等 DeepSeek 创新组件。
     """
 
     def __init__(self, config: TransformerBlockConfig):
@@ -146,19 +128,15 @@ class TransformerBlock(nn.Module):
         self.d_model = config.d_model
         self.max_seq_len = config.max_seq_len
 
-        self.norm1 = RMSNorm(
-            dim=config.d_model,
-            eps=config.rms_norm_eps)
+        # 注意力子层的 pre-norm
+        self.norm1 = RMSNorm(dim=config.d_model, eps=config.rms_norm_eps)
+        # 因果多头注意力
+        self.attention = CausalMultiHeadAttention(config.to_attention_config())
 
-        self.attention = CausalMultiHeadAttention(
-            config.to_attention_config())
-
-        self.norm2 = RMSNorm(
-            dim=config.d_model,
-            eps=config.rms_norm_eps,)
-
-        self.mlp = SwiGLUMLP(
-            config.to_mlp_config())
+        # MLP 子层的 pre-norm
+        self.norm2 = RMSNorm(dim=config.d_model, eps=config.rms_norm_eps)
+        # SwiGLU 前馈网络
+        self.mlp = SwiGLUMLP(config.to_mlp_config())
 
     def forward(
         self,
@@ -168,36 +146,14 @@ class TransformerBlock(nn.Module):
         start_pos: int = 0,
         need_weights: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """
-        Args:
-            x:
-                Hidden states [B, T, d_model].
-
-            attention_mask:
-                Optional attention mask [B, T].
-                1 = valid token.
-                0 = padding token.
-
-            position_ids:
-                Optional RoPE position ids.
-                None, [T], or [B, T].
-
-            start_pos:
-                RoPE offset when position_ids is None.
-
-            need_weights:
-                Whether to return attention weights in aux dict.
-
-        Returns:
-            x:
-                Updated hidden states [B, T, d_model].
-
-            optionally:
-                x, {"attn_weights": attn_weights}
+        参数:
+            x: 隐藏状态 [B, T, d_model]
+            attention_mask: 可选 [B, T]，1=有效，0=padding
+            position_ids: 可选 RoPE 位置
+            start_pos: RoPE 偏移
+            need_weights: 是否返回 attention 权重
         """
 
-        # ----------------------------------------------------
-        # Input validation
-        # ----------------------------------------------------
         if x.dim() != 3:
             raise ValueError(
                 f"TransformerBlock expects x with shape [B, T, d_model], "
@@ -216,11 +172,8 @@ class TransformerBlock(nn.Module):
                 f"Sequence length T={T} exceeds max_seq_len={self.max_seq_len}"
             )
 
-        # ----------------------------------------------------
-        # Attention sublayer: pre-norm + residual
-        # ----------------------------------------------------
+        # === 注意力子层: Pre-Norm + Attention + 残差 ===
         residual = x
-
         x_norm = self.norm1(x)
 
         attn_result = self.attention(
@@ -236,24 +189,16 @@ class TransformerBlock(nn.Module):
             attn_out = attn_result
             attn_weights = None
 
-        x = residual + attn_out
+        x = residual + attn_out  # 残差连接
 
-        # ----------------------------------------------------
-        # MLP sublayer: pre-norm + residual
-        # ----------------------------------------------------
+        # === MLP 子层: Pre-Norm + SwiGLU + 残差 ===
         residual = x
-
         x_norm = self.norm2(x)
         mlp_out = self.mlp(x_norm)
+        x = residual + mlp_out   # 残差连接
 
-        x = residual + mlp_out
-
-        # ----------------------------------------------------
-        # Return
-        # ----------------------------------------------------
         if need_weights:
-            aux = {
-                "attn_weights": attn_weights}
+            aux = {"attn_weights": attn_weights}
             return x, aux
 
         return x

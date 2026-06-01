@@ -1,6 +1,8 @@
-# ============================================================
-# Mini DeepSeek-V4 Causal Multi-Head Attention Baseline
-# ============================================================
+"""
+标准因果多头注意力 (Causal Multi-Head Attention)
+这是 Transformer 的核心组件，实现 self-attention + 因果 mask。
+流程: x -> Q/K/V投影 -> RoPE -> scaled dot-product attention -> 输出投影
+"""
 
 import math
 from dataclasses import dataclass
@@ -12,25 +14,22 @@ import torch.nn.functional as F
 
 from src.transformer_modules.rope import *
 
-# ============================================================
-# CONFIG
-# ============================================================
 
 @dataclass
 class CausalMHAConfig:
-    d_model: int
-    n_heads: int
+    d_model: int                            # 模型维度
+    n_heads: int                            # 注意力头数
 
-    head_dim: Optional[int] = None
+    head_dim: Optional[int] = None          # 每个头的维度（默认 d_model // n_heads）
 
-    attention_dropout: float = 0.0
-    residual_dropout: float = 0.0
+    attention_dropout: float = 0.0          # attention 权重上的 dropout
+    residual_dropout: float = 0.0           # 输出投影后的 dropout
 
-    use_bias: bool = False
+    use_bias: bool = False                  # Q/K/V/O 投影是否使用 bias
 
-    use_rope: bool = True
-    rope_theta: float = 10000.0
-    rotary_dim: Optional[int] = None
+    use_rope: bool = True                   # 是否使用旋转位置编码
+    rope_theta: float = 10000.0             # RoPE 的基频
+    rotary_dim: Optional[int] = None        # RoPE 作用的维度数（默认全部）
 
     max_seq_len: int = 1024
     init_std: float = 0.02
@@ -57,7 +56,6 @@ class CausalMHAConfig:
 
         inner_dim = self.n_heads * head_dim
 
-        # Baseline MHA: keep merge simple.
         if inner_dim != self.d_model:
             raise ValueError(
                 "For baseline CausalMHA, n_heads * head_dim must equal d_model. "
@@ -104,37 +102,21 @@ class CausalMHAConfig:
                 )
 
 
-# ============================================================
-# CAUSAL MULTI-HEAD ATTENTION
-# ============================================================
-
 class CausalMultiHeadAttention(nn.Module):
     """
-    Baseline causal multi-head self-attention.
-
-    Input:
-        x: [B, T, d_model]
-
-    Optional:
-        attention_mask: [B, T]
-            1 = valid token
-            0 = padding / invalid key token
-
-        position_ids:
-            None, [T], or [B, T]
-
-        start_pos:
-            offset used by RoPE when position_ids is None
-
-        need_weights:
-            if True, returns attention weights.
-
-    Output:
-        out: [B, T, d_model]
-
-        if need_weights=True:
-            out, attn_weights
-            attn_weights: [B, n_heads, T, T]
+    因果多头自注意力。
+    
+    输入: x [B, T, d_model]
+    输出: out [B, T, d_model]
+    
+    核心流程:
+    1. 线性投影得到 Q, K, V  (每个 [B, T, n_heads, head_dim])
+    2. 对 Q, K 施加 RoPE 位置编码
+    3. 计算 attention score: Q @ K^T / sqrt(head_dim)
+    4. 应用因果 mask (上三角为 -inf，确保只能看到之前的 token)
+    5. softmax 归一化得到 attention 权重
+    6. 加权求和: attention_weights @ V
+    7. 合并多头后线性投影输出
     """
 
     def __init__(self, config: CausalMHAConfig):
@@ -156,32 +138,18 @@ class CausalMultiHeadAttention(nn.Module):
 
         self.use_rope = config.use_rope
 
-        self.q_proj = nn.Linear(
-            self.d_model,
-            self.inner_dim,
-            bias=config.use_bias,)
+        # Q/K/V/O 四个线性投影
+        self.q_proj = nn.Linear(self.d_model, self.inner_dim, bias=config.use_bias)
+        self.k_proj = nn.Linear(self.d_model, self.inner_dim, bias=config.use_bias)
+        self.v_proj = nn.Linear(self.d_model, self.inner_dim, bias=config.use_bias)
+        self.out_proj = nn.Linear(self.inner_dim, self.d_model, bias=config.use_bias)
 
-        self.k_proj = nn.Linear(
-            self.d_model,
-            self.inner_dim,
-            bias=config.use_bias, )
-
-        self.v_proj = nn.Linear(
-            self.d_model,
-            self.inner_dim,
-            bias=config.use_bias,)
-
-        self.out_proj = nn.Linear(
-            self.inner_dim,
-            self.d_model,
-            bias=config.use_bias,)
-
+        # RoPE 模块（只作用于 Q 和 K）
         if self.use_rope:
             self.rope = RotaryEmbedding(
                 dim=self.head_dim,
                 rotary_dim=config.rotary_dim,
                 base=config.rope_theta,)
-
         else:
             self.rope = None
 
@@ -191,44 +159,22 @@ class CausalMultiHeadAttention(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        """
-        Initialize projections with Normal(0, init_std).
-        Biases, if present, are initialized to zero.
-        """
+        """正态分布初始化所有投影层"""
         for module in [self.q_proj, self.k_proj, self.v_proj, self.out_proj]:
-            nn.init.normal_(
-                module.weight,
-                mean=0.0,
-                std=self.config.init_std,)
-
+            nn.init.normal_(module.weight, mean=0.0, std=self.config.init_std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
     def _shape_projection(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Convert projected tensor from:
-
-            [B, T, inner_dim]
-
-        to:
-
-            [B, T, n_heads, head_dim]
-        """
+        """将投影结果 reshape: [B, T, inner_dim] -> [B, T, n_heads, head_dim]"""
         B, T, _ = x.shape
-
         return x.view(B, T, self.n_heads, self.head_dim)
 
-    def _build_causal_mask(
-        self,
-        seq_len: int,
-        device: torch.device) -> torch.Tensor:
-
+    def _build_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """
-        Build causal future mask.
-
-        Returns:
-            causal_mask: [T, T]
-            True means masked / forbidden.
+        构建因果 mask（上三角矩阵）。
+        True 表示该位置被遮蔽（不允许 attend）。
+        即: token t 只能看到位置 <= t 的 key。
         """
         return torch.triu(
             torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
@@ -239,14 +185,6 @@ class CausalMultiHeadAttention(nn.Module):
         attention_mask: torch.Tensor,
         batch_size: int,
         seq_len: int) -> torch.Tensor:
-        """
-        Validate and return attention_mask.
-
-        Expected:
-            attention_mask: [B, T]
-            1 = valid
-            0 = pad / invalid
-        """
         if attention_mask.dim() != 2:
             raise ValueError(
                 f"attention_mask must have shape [B, T], "
@@ -265,25 +203,8 @@ class CausalMultiHeadAttention(nn.Module):
       allowed_mask: torch.Tensor,
       dim: int = -1) -> torch.Tensor:
       """
-      Safe masked softmax.
-
-      Args:
-          scores:
-              Attention scores [B, H, T, T].
-
-          allowed_mask:
-              Boolean mask broadcastable to scores.
-              True  = allowed attention position.
-              False = masked / forbidden position.
-
-          dim:
-              Softmax dimension.
-
-      Returns:
-          attn_weights:
-              Same shape as scores.
-              Rows with at least one valid key sum to 1.
-              Rows with no valid keys are exactly zero.
+      安全的带 mask 的 softmax。
+      处理边界情况: 当某一行所有 key 都被 mask 时，输出精确的零向量（而非 NaN）。
       """
 
       if allowed_mask.dtype != torch.bool:
@@ -291,17 +212,17 @@ class CausalMultiHeadAttention(nn.Module):
 
       mask_value = torch.finfo(scores.dtype).min
 
+      # 被 mask 的位置填充极小值
       masked_scores = scores.masked_fill(~allowed_mask, mask_value)
 
-      # Softmax in fp32 for numerical stability
+      # fp32 softmax 保证数值稳定
       weights = F.softmax(masked_scores.float(), dim=dim).to(dtype=scores.dtype)
 
-      # Remove any mass assigned to masked positions.
+      # 清除 mask 位置可能残留的概率
       weights = weights * allowed_mask.to(dtype=weights.dtype)
 
-      # Renormalize only rows with at least one allowed key.
+      # 重新归一化（处理全 mask 行）
       denom = weights.sum(dim=dim, keepdim=True)
-
       weights = torch.where(
           denom > 0,
           weights / denom.clamp_min(torch.finfo(weights.dtype).tiny),
@@ -318,36 +239,19 @@ class CausalMultiHeadAttention(nn.Module):
         start_pos: int = 0,
         need_weights: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Args:
-            x:
-                Hidden states [B, T, d_model].
-
-            attention_mask:
-                Optional mask [B, T].
-                1 = valid token.
-                0 = padding token.
-
-            position_ids:
-                Optional positions for RoPE.
-                None, [T], or [B, T].
-
-            start_pos:
-                RoPE offset used when position_ids is None.
-
-            need_weights:
-                Whether to return attention weights.
-
-        Returns:
-            out:
-                [B, T, d_model]
-
-            optionally:
-                attn_weights [B, n_heads, T, T]
+        前向传播。
+        
+        参数:
+            x: 隐藏状态 [B, T, d_model]
+            attention_mask: 可选 [B, T]，1=有效token，0=padding
+            position_ids: 可选 RoPE 位置
+            start_pos: RoPE 偏移量
+            need_weights: 是否返回 attention 权重
+        
+        返回:
+            out [B, T, d_model]，可选返回 attn_weights [B, H, T, T]
         """
 
-        # ----------------------------------------------------
-        # Input validation
-        # ----------------------------------------------------
         if x.dim() != 3:
             raise ValueError(
                 f"CausalMultiHeadAttention expects x with shape [B, T, d_model], "
@@ -359,11 +263,9 @@ class CausalMultiHeadAttention(nn.Module):
             raise ValueError(
                 f"Expected x.shape[-1] == d_model={self.d_model}, got {C}")
 
-
         if T > self.max_seq_len:
             raise ValueError(
                 f"Sequence length T={T} exceeds max_seq_len={self.max_seq_len}")
-
 
         if attention_mask is not None:
             attention_mask = self._validate_attention_mask(
@@ -371,95 +273,51 @@ class CausalMultiHeadAttention(nn.Module):
                 batch_size=B,
                 seq_len=T,)
 
+        # === Q/K/V 投影 ===
+        q = self._shape_projection(self.q_proj(x))  # [B, T, H, Dh]
+        k = self._shape_projection(self.k_proj(x))  # [B, T, H, Dh]
+        v = self._shape_projection(self.v_proj(x))  # [B, T, H, Dh]
 
-        # ----------------------------------------------------
-        # QKV projections
-        # ----------------------------------------------------
-        q = self.q_proj(x)  # [B, T, inner_dim]
-        k = self.k_proj(x)  # [B, T, inner_dim]
-        v = self.v_proj(x)  # [B, T, inner_dim]
-
-        q = self._shape_projection(q)  # [B, T, H, Dh]
-        k = self._shape_projection(k)  # [B, T, H, Dh]
-        v = self._shape_projection(v)  # [B, T, H, Dh]
-
-        # ----------------------------------------------------
-        # RoPE on q/k only
-        # ----------------------------------------------------
+        # === RoPE: 给 Q 和 K 注入位置信息 ===
         if self.rope is not None:
-            q = self.rope(
-                q,
-                position_ids=position_ids,
-                start_pos=start_pos,)
+            q = self.rope(q, position_ids=position_ids, start_pos=start_pos)
+            k = self.rope(k, position_ids=position_ids, start_pos=start_pos)
 
-            k = self.rope(
-                k,
-                position_ids=position_ids,
-                start_pos=start_pos,)
+        # 转置为 [B, H, T, Dh] 以便计算 attention score
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
-        # ----------------------------------------------------
-        # Transpose for attention scores
-        # ----------------------------------------------------
-        q = q.transpose(1, 2)  # [B, H, T, Dh]
-        k = k.transpose(1, 2)  # [B, H, T, Dh]
-        v = v.transpose(1, 2)  # [B, H, T, Dh]
-
-        # ----------------------------------------------------
-        # Scaled dot-product attention scores
-        # ----------------------------------------------------
+        # === Scaled Dot-Product Attention ===
+        # score = Q @ K^T / sqrt(d_k)
         attn_scores = torch.matmul(q, k.transpose(-2, -1))
         attn_scores = attn_scores / math.sqrt(self.head_dim)
 
-
-        # ----------------------------------------------------
-        # Causal mask
-        # ----------------------------------------------------
-        causal_mask = self._build_causal_mask(
-            seq_len=T,
-            device=x.device) # [T, T]
-
+        # === 因果 mask: 上三角填充 -inf ===
+        causal_mask = self._build_causal_mask(seq_len=T, device=x.device)
         mask_value = torch.finfo(attn_scores.dtype).min
-
         attn_scores = attn_scores.masked_fill(
-            causal_mask[None, None, :, :],
+            causal_mask[None, None, :, :],  # 广播到 [B, H, T, T]
             mask_value)
 
-        # --------------------------------------------------
-        # Optional key padding mask
-        # ----------------------------------------------------
+        # === 可选的 padding mask ===
         if attention_mask is not None:
             key_padding_mask = attention_mask[:, None, None, :].to(
-                device=x.device,
-                dtype=torch.bool) # [B, 1, 1, T]
+                device=x.device, dtype=torch.bool)  # [B, 1, 1, T]
+            attn_scores = attn_scores.masked_fill(~key_padding_mask, mask_value)
 
-            attn_scores = attn_scores.masked_fill(
-                ~key_padding_mask,
-                mask_value,)
-
-        # ----------------------------------------------------
-        # Softmax attention weights
-        # ----------------------------------------------------
-        # Compute softmax in fp32 for stability, then cast back.
-        attn_weights = F.softmax(
-            attn_scores.float(),
-            dim=-1,).to(dtype=attn_scores.dtype)
-
+        # === Softmax (fp32 保证稳定性) ===
+        attn_weights = F.softmax(attn_scores.float(), dim=-1).to(dtype=attn_scores.dtype)
         attn_weights = self.attention_dropout(attn_weights)
 
-        # ----------------------------------------------------
-        # Weighted sum
-        # ----------------------------------------------------
-        context = torch.matmul(attn_weights, v) # [B, H, T, Dh]
+        # === 加权求和: attention_weights @ V ===
+        context = torch.matmul(attn_weights, v)  # [B, H, T, Dh]
 
-        # ----------------------------------------------------
-        # Merge heads
-        # ----------------------------------------------------
-        context = context.transpose(1, 2).contiguous()# [B, T, H, Dh]
-        context = context.view(B, T, self.inner_dim) # [B, T, inner_dim]
+        # === 合并多头: [B, H, T, Dh] -> [B, T, H*Dh] ===
+        context = context.transpose(1, 2).contiguous()
+        context = context.view(B, T, self.inner_dim)
 
-        # ----------------------------------------------------
-        # Output projection + residual dropout
-        # ----------------------------------------------------
+        # === 输出投影 ===
         out = self.out_proj(context)
         out = self.residual_dropout(out)
 
@@ -476,6 +334,10 @@ class CausalMultiHeadAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
     ):
+        """
+        解码阶段的单步推理（使用 KV cache）。
+        输入: x_t [B, 1, d_model] 当前时间步的隐藏状态
+        """
         if x_t.dim() != 3 or x_t.shape[1] != 1:
             raise ValueError(f"forward_decode expects x_t [B,1,D], got {tuple(x_t.shape)}")
 
@@ -495,9 +357,12 @@ class CausalMultiHeadAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
+        # 将当前步的 K, V 追加到 cache 中
         cache.append(k, v, position_ids)
+        # 获取完整的 K, V 历史
         k_all, v_all = cache.get_kv()
 
+        # 当前 query 对所有历史 key 做 attention
         attn_scores = torch.matmul(q, k_all.transpose(-2, -1))
         attn_scores = attn_scores / math.sqrt(self.head_dim)
 
@@ -508,13 +373,10 @@ class CausalMultiHeadAttention(nn.Module):
                     f"got {tuple(attention_mask.shape)}"
                 )
             key_padding_mask = attention_mask[:, None, None, :].to(
-                device=x_t.device,
-                dtype=torch.bool,
-            )
+                device=x_t.device, dtype=torch.bool)
             attn_scores = attn_scores.masked_fill(
                 ~key_padding_mask,
-                torch.finfo(attn_scores.dtype).min,
-            )
+                torch.finfo(attn_scores.dtype).min)
 
         attn_weights = F.softmax(attn_scores.float(), dim=-1).to(dtype=attn_scores.dtype)
         attn_weights = self.attention_dropout(attn_weights)

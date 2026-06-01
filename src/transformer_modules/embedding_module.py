@@ -1,7 +1,8 @@
-# ============================================================
-# Mini DeepSeek-V4 Token Embedding Module
-# Token identity only — no positional embeddings
-# ============================================================
+"""
+Token Embedding 模块
+将 token id 映射为稠密向量，支持 weight tying（与 LM head 共享权重）。
+不包含位置编码——位置信息由后续 RoPE 在 attention 中注入。
+"""
 
 import math
 from dataclasses import dataclass
@@ -12,31 +13,21 @@ from typing import List, Dict, Tuple, Union
 import torch.nn as nn
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 @dataclass
 class EmbeddingConfig:
-    vocab_size: int
-    d_model: int
+    vocab_size: int                     # 词表大小 V
+    d_model: int                        # 嵌入维度 D
 
-    pad_token_id: Optional[int] = None
-    max_seq_len: int = 1024
+    pad_token_id: Optional[int] = None  # padding token 的 id，其嵌入向量固定为零
+    max_seq_len: int = 1024             # 最大序列长度
 
     embedding_dropout: float = 0.0
-    scale_embeddings: bool = False
-
+    scale_embeddings: bool = False      # 是否乘以 sqrt(d_model)，某些模型使用此缩放
+    
     init_std: float = 0.02
-    tie_word_embeddings: bool = True
+    tie_word_embeddings: bool = True    # 是否与 LM head 共享权重
 
     def validate(self) -> None:
-        """
-        Validate embedding configuration early.
-
-        This prevents silent configuration bugs before constructing
-        nn.Embedding or starting training.
-        """
         if self.vocab_size <= 0:
             raise ValueError(f"vocab_size must be > 0, got {self.vocab_size}")
 
@@ -62,28 +53,16 @@ class EmbeddingConfig:
                     f"vocab_size={self.vocab_size}")
 
 
-# ============================================================
-# TOKEN EMBEDDING
-# ============================================================
-
 class TokenEmbedding(nn.Module):
     """
-    Token embedding module for causal language modeling.
-
-    Responsibility:
-        input_ids: [B, T] -> hidden_states: [B, T, d_model]
-
-    This module intentionally does NOT include:
-        - positional embeddings
-        - RoPE
-        - attention masks
-        - RMSNorm
-        - MoE
-        - mHC
-        - loss logic
-
-    Positional information should be handled later inside attention,
-    e.g. via RoPE or partial RoPE.
+    Token 嵌入层。
+    
+    功能: input_ids [B, T] -> hidden_states [B, T, d_model]
+    
+    特性:
+    - 支持 padding_idx: 该位置的嵌入固定为零且不更新梯度
+    - 支持 scale_embeddings: 乘以 sqrt(d_model)
+    - 支持 weight tying: 通过 .weight 属性暴露参数供 LM head 复用
     """
 
     def __init__(self, config: EmbeddingConfig):
@@ -98,6 +77,7 @@ class TokenEmbedding(nn.Module):
         self.max_seq_len = config.max_seq_len
         self.scale_embeddings = config.scale_embeddings
 
+        # nn.Embedding: 查表操作，将整数 id 映射为 d_model 维向量
         self.token_embedding = nn.Embedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.d_model,
@@ -108,16 +88,7 @@ class TokenEmbedding(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        """
-        Initialize token embedding weights.
-
-        Uses GPT-style normal initialization:
-            weight ~ N(0, init_std)
-
-        If pad_token_id is provided, its row is forced to zero.
-        nn.Embedding(..., padding_idx=...) also prevents that row
-        from receiving gradient updates.
-        """
+        """GPT 风格初始化: N(0, init_std)，pad 行强制为零"""
         nn.init.normal_(
             self.token_embedding.weight,
             mean=0.0,
@@ -131,20 +102,11 @@ class TokenEmbedding(nn.Module):
           self,
           input_ids: Union[torch.Tensor, Dict[str, torch.Tensor]],) -> torch.Tensor:
           """
-          Args:
-              input_ids:
-                  Either:
-                    - Tensor [B, T]
-                    - Dict with key "input_ids"
-
-          Returns:
-              hidden_states:
-                  Float tensor [B, T, d_model]
+          输入: input_ids [B, T] 或包含 "input_ids" 键的字典
+          输出: hidden_states [B, T, d_model]
           """
 
-          # ----------------------------------------------------
-          # Accept dict batches defensively
-          # ----------------------------------------------------
+          # 兼容字典输入（如 HuggingFace DataLoader 的输出）
           if isinstance(input_ids, dict):
               if "input_ids" not in input_ids:
                   raise KeyError(
@@ -154,9 +116,7 @@ class TokenEmbedding(nn.Module):
 
               input_ids = input_ids["input_ids"]
 
-          # ----------------------------------------------------
-          # Shape validation
-          # ----------------------------------------------------
+          # 形状检查
           if not torch.is_tensor(input_ids):
               raise TypeError(
                   "TokenEmbedding expects either a tensor [B, T] or a dict containing "
@@ -175,9 +135,7 @@ class TokenEmbedding(nn.Module):
                   f"Sequence length T={seq_len} exceeds max_seq_len={self.max_seq_len}"
               )
 
-          # ----------------------------------------------------
-          # Dtype validation
-          # ----------------------------------------------------
+          # 类型检查: 必须是整数类型
           if input_ids.dtype not in (torch.long, torch.int64, torch.int32):
               raise TypeError(
                   "input_ids must contain integer token indices; "
@@ -187,9 +145,7 @@ class TokenEmbedding(nn.Module):
           if input_ids.dtype != torch.long:
               input_ids = input_ids.long()
 
-          # ----------------------------------------------------
-          # Range validation
-          # ----------------------------------------------------
+          # 范围检查
           if torch.any(input_ids < 0):
               min_id = int(input_ids.min().item())
               raise ValueError(
@@ -203,30 +159,18 @@ class TokenEmbedding(nn.Module):
                   f"Maximum id found: {max_id}, vocab_size={self.vocab_size}"
               )
 
-          # ----------------------------------------------------
-          # Token embedding lookup
-          # ----------------------------------------------------
+          # 核心操作: 查表得到嵌入向量
           hidden_states = self.token_embedding(input_ids)
 
-          # ----------------------------------------------------
-          # Optional scaling
-          # ----------------------------------------------------
+          # 可选缩放: 乘以 sqrt(d_model)，补偿嵌入值的方差
           if self.scale_embeddings:
               hidden_states = hidden_states * math.sqrt(self.d_model)
 
-          # ----------------------------------------------------
-          # Dropout
-          # ----------------------------------------------------
           hidden_states = self.dropout(hidden_states)
 
           return hidden_states
 
     @property
     def weight(self) -> nn.Parameter:
-        """
-        Expose embedding weight for optional LM-head weight tying.
-
-        Example in full model:
-            lm_head.weight = embedding.weight
-        """
+        """暴露嵌入权重，用于 LM head 的 weight tying"""
         return self.token_embedding.weight

@@ -1,25 +1,18 @@
+"""
+RMSNorm (Root Mean Square Layer Normalization)
+相比 LayerNorm，RMSNorm 去掉了均值中心化步骤，只做缩放归一化，计算更快。
+公式: y = x / sqrt(mean(x^2) + eps) * weight
+"""
+
 import torch 
 import torch.nn as nn
 
 class RMSNorm(nn.Module):
     """
-    Root Mean Square Layer Normalization.
-
-    Input:
-        x: [..., D]
-
-    Forward:
-        1. Save original dtype.
-        2. Cast x to float32 for stable RMS computation.
-        3. Compute mean(x^2) over last dimension.
-        4. Apply rsqrt(mean_square + eps).
-        5. Normalize x.
-        6. Cast normalized x back to original dtype if needed.
-        7. Multiply by learnable weight.
-        8. Return y.
-
-    Output:
-        y: [..., D]
+    RMS 归一化层。
+    - 输入: [..., D] 任意前缀维度，最后一维为特征维度
+    - 输出: [..., D] 归一化后的张量，与输入同形状
+    - weight: 可学习的逐元素缩放参数，初始为全1
     """
 
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -33,6 +26,7 @@ class RMSNorm(nn.Module):
 
         self.dim = dim
         self.eps = eps
+        # 可学习的缩放权重，初始化为全1（不改变原始分布）
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -44,21 +38,25 @@ class RMSNorm(nn.Module):
 
       original_dtype = x.dtype
 
-      # Compute RMS in float32 for numerical stability
+      # 转为 float32 计算 RMS，避免 fp16/bf16 下溢出
       x_float = x.float()
 
+      # 计算均方值: mean(x^2)
       mean_square = x_float.pow(2).mean(dim=-1, keepdim=True)
+      # rsqrt = 1/sqrt(mean_square + eps)
       inv_rms = torch.rsqrt(mean_square + self.eps)
 
+      # 归一化: x * (1 / rms)
       y = x_float * inv_rms
 
-      # Cast normalized activations back to original dtype
+      # 转回原始精度
       if y.dtype != original_dtype:
           y = y.to(original_dtype)
 
-      # Important: cast weight too, otherwise output is promoted to float32
+      # weight 也转为对应精度，避免输出被提升为 float32
       weight = self.weight.to(dtype=original_dtype)
 
+      # 乘以可学习权重
       y = y * weight
 
       return y
