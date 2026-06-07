@@ -204,7 +204,7 @@ def test_invalid_ffn_type_raises(ffn_type):
 # B. Forward basic
 # ============================================================
 
-@pytest.mark.parametrize("attention_type", ["mha", "hca", "csa"])
+@pytest.mark.parametrize("attention_type", ["mha", "hca", "csa", "linear"])
 def test_logits_shape_all_attention_types(attention_type):
     B, T, V = 2, 12, 128
 
@@ -454,7 +454,7 @@ def test_return_aux_contains_blocks():
     assert len(outputs["aux"]["blocks"]) == 2
 
 
-@pytest.mark.parametrize("attention_type", ["mha", "hca", "csa"])
+@pytest.mark.parametrize("attention_type", ["mha", "hca", "csa", "linear"])
 def test_need_weights_attention_aux_shapes(attention_type):
     B, T, V = 2, 12, 128
 
@@ -476,7 +476,7 @@ def test_need_weights_attention_aux_shapes(attention_type):
 
     block_aux = outputs["aux"]["blocks"][0]
 
-    if attention_type == "mha":
+    if attention_type in {"mha", "linear"}:
         if "attention" in block_aux:
             attn_aux = block_aux["attention"]
 
@@ -491,7 +491,7 @@ def test_need_weights_attention_aux_shapes(attention_type):
 
             else:
                 raise TypeError(
-                    "MHA attention aux must be either a tensor or a dict, "
+                    "MHA/linear attention aux must be either a tensor or a dict, "
                     f"got {type(attn_aux)}"
                 )
 
@@ -572,7 +572,7 @@ def test_mhc_aux_present_when_use_mhc():
 # F. Causality
 # ============================================================
 
-@pytest.mark.parametrize("attention_type", ["mha", "hca", "csa"])
+@pytest.mark.parametrize("attention_type", ["mha", "hca", "csa", "linear"])
 def test_changing_future_tokens_does_not_change_past_logits(attention_type):
     B, T, V = 2, 16, 128
     cut = 8

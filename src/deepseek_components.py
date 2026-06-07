@@ -17,6 +17,7 @@ from src.deepseek_hca_attention import *
 from src.deepseek_moe import * 
 from src.deepseek_mtp import *  
 from src.mHC_residuals import * 
+from src.transformer_modules.linear_attention import *
 from src.transformer_modules.mha_baseline import *  
 
 # ============================================================
@@ -59,8 +60,9 @@ class DeepSeekV4LMConfig:
     # "mha"    -> all layers use standard MHA
     # "hca"    -> all layers use HCA
     # "csa"    -> all layers use CSA
+    # "linear" -> all layers use causal linear attention
     # "hybrid" -> interleaves attention modules by layer according to attention_pattern
-    attention_type: str = "hybrid"  # "mha", "hca", "csa", "hybrid"
+    attention_type: str = "hybrid"  # "mha", "hca", "csa", "linear", "hybrid"
     attention_pattern: Tuple[str, ...] = ("csa", "hca")
     n_heads: int = 4
     head_dim: Optional[int] = None
@@ -176,9 +178,9 @@ class DeepSeekV4LMConfig:
         if self.rms_norm_eps <= 0:
             raise ValueError(f"rms_norm_eps must be > 0, got {self.rms_norm_eps}")
 
-        if self.attention_type not in {"mha", "hca", "csa", "hybrid"}:
+        if self.attention_type not in {"mha", "hca", "csa", "linear", "hybrid"}:
             raise ValueError(
-                f"attention_type must be one of {{'mha','hca','csa','hybrid'}}, "
+                f"attention_type must be one of {{'mha','hca','csa','linear','hybrid'}}, "
                 f"got {self.attention_type}"
             )
 
@@ -194,10 +196,10 @@ class DeepSeekV4LMConfig:
                 )
 
             for attn_name in self.attention_pattern:
-                if attn_name not in {"mha", "hca", "csa"}:
+                if attn_name not in {"mha", "hca", "csa", "linear"}:
                     raise ValueError(
                         "Every element of attention_pattern must be one of "
-                        f"{{'mha','hca','csa'}}, got {attn_name}"
+                        f"{{'mha','hca','csa','linear'}}, got {attn_name}"
                     )
 
         if self.ffn_type not in {"dense", "moe"}:
@@ -353,6 +355,23 @@ def build_deepseek_attention(
             )
         )
 
+    if attention_type == "linear":
+        return CausalLinearAttention(
+            CausalLinearAttentionConfig(
+                d_model=config.d_model,
+                n_heads=config.n_heads,
+                head_dim=config.head_dim,
+                attention_dropout=config.attention_dropout,
+                residual_dropout=config.residual_dropout,
+                use_bias=config.use_attention_bias,
+                use_rope=config.use_rope,
+                rope_theta=config.rope_theta,
+                rotary_dim=config.rotary_dim,
+                max_seq_len=config.max_seq_len,
+                init_std=config.init_std,
+            )
+        )
+
     if attention_type == "hca":
         hca_kwargs = dict(
             d_model=config.d_model,
@@ -426,7 +445,7 @@ def get_layer_attention_type(config: DeepSeekV4LMConfig, layer_idx: int) -> str:
     Resolve the concrete attention type for a given layer.
 
     If config.attention_type is:
-        - "mha", "hca", or "csa": all layers use that attention.
+        - "mha", "hca", "csa", or "linear": all layers use that attention.
         - "hybrid": layer attention is selected from attention_pattern cyclically.
 
     Example:

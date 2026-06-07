@@ -41,7 +41,7 @@ class DeepSeekV4LM(nn.Module):
         optional MTP head
 
     Supported switches:
-        attention_type: "mha", "hca", "csa", "hybrid"
+        attention_type: "mha", "hca", "csa", "linear", "hybrid"
         attention_pattern: cyclic per-layer schedule used when attention_type="hybrid"
         ffn_type: "dense", "moe"
         use_mhc: bool

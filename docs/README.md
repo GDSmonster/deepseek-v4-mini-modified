@@ -14,6 +14,7 @@
 
 - [架构总览](architecture/overview.md)
 - [Attention 模块:MHA、HCA、CSA](architecture/attention_modules.md)
+- [Linear Attention 变体](architecture/linear_attention.md)
 - [HCA:Heavily Compressed Attention](architecture/hca.md)
 - [CSA:Compressed Sparse Attention](architecture/csa.md)
 - [MoE 与 Dense FFN](architecture/moe_and_ffn.md)
